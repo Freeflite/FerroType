@@ -1,0 +1,11 @@
+[package]
+name = "ferrotype-core"
+description = "Typing loop, hotkeys, history and settings for FerroType. Contains no unsafe code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true

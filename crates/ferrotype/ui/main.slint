@@ -1,0 +1,830 @@
+import { AboutSlint, Button, CheckBox, ComboBox, LineEdit, ListView, Palette, ScrollView, TextEdit } from "std-widgets.slint";
+import { Theme, Hint, Icons } from "theme.slint";
+
+export { Theme }
+
+// One history entry as the list shows it.
+export struct HistoryRow {
+    id: int,
+    preview: string,
+    detail: string,
+    pinned: bool,
+}
+
+// A small square button with a drawn icon. Its `hint` shows under the history list on hover.
+component IconButton inherits Rectangle {
+    in property <string> commands;
+    in property <bool> filled;
+    in property <string> hint;
+    in property <color> tint: Theme.muted;
+    callback clicked();
+
+    width: 26px;
+    height: 26px;
+    border-radius: 4px;
+    background: touch.has-hover ? Theme.hover : transparent;
+    accessible-role: button;
+    accessible-label: root.hint;
+    accessible-action-default => {
+        root.clicked();
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+        changed has-hover => {
+            Hint.text = self.has-hover ? root.hint : "";
+        }
+    }
+
+    Path {
+        x: (parent.width - 16px) / 2;
+        y: (parent.height - 16px) / 2;
+        width: 16px;
+        height: 16px;
+        viewbox-width: 16;
+        viewbox-height: 16;
+        commands: root.commands;
+        stroke: touch.has-hover ? Theme.text : root.tint;
+        stroke-width: 1.4px;
+        fill: root.filled ? (touch.has-hover ? Theme.text : root.tint) : transparent;
+    }
+}
+
+// An icon button centred in a row.
+component RowIcon inherits VerticalLayout {
+    in property <string> commands;
+    in property <bool> filled;
+    in property <string> hint;
+    in property <color> tint: Theme.muted;
+    callback clicked();
+    alignment: center;
+
+    IconButton {
+        commands: root.commands;
+        filled: root.filled;
+        hint: root.hint;
+        tint: root.tint;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+component HistoryItem inherits Rectangle {
+    in property <HistoryRow> entry;
+    callback open-it();
+    callback type-it();
+    callback copy();
+    callback toggle-pin();
+    callback remove();
+
+    height: 48px;
+    background: area.has-hover ? Theme.hover : (root.entry.pinned ? Theme.pinned : transparent);
+
+    area := TouchArea {
+        clicked => {
+            root.open-it();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 4px;
+        spacing: 4px;
+
+        RowIcon {
+            commands: Icons.pin;
+            filled: root.entry.pinned;
+            tint: root.entry.pinned ? Theme.accent : Theme.muted;
+            hint: root.entry.pinned ? "Unpin" : "Pin: keep it until you unpin it";
+            clicked => {
+                root.toggle-pin();
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.entry.preview;
+                overflow: elide;
+                color: Theme.text;
+            }
+
+            Text {
+                text: root.entry.detail;
+                overflow: elide;
+                color: Theme.muted;
+                font-size: 11px;
+            }
+        }
+
+        RowIcon {
+            commands: Icons.play;
+            filled: true;
+            hint: "Type it (after the countdown)";
+            clicked => {
+                root.type-it();
+            }
+        }
+
+        RowIcon {
+            commands: Icons.copy;
+            hint: "Copy to the clipboard";
+            clicked => {
+                root.copy();
+            }
+        }
+
+        RowIcon {
+            commands: Icons.trash;
+            hint: "Delete";
+            clicked => {
+                root.remove();
+            }
+        }
+    }
+
+    Rectangle {
+        y: parent.height - 1px;
+        height: 1px;
+        background: Theme.border;
+    }
+}
+
+component SectionTitle inherits Text {
+    font-size: 15px;
+    font-weight: 700;
+    color: Theme.accent;
+}
+
+component Note inherits Text {
+    wrap: word-wrap;
+    color: Theme.muted;
+    font-size: 11px;
+}
+
+component Label inherits Text {
+    vertical-alignment: center;
+    color: Theme.text;
+}
+
+// A tab in the strip at the top.
+component Tab inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected;
+    callback clicked();
+
+    height: 32px;
+    min-width: label.preferred-width + 32px;
+    border-radius: 6px;
+    background: root.selected ? Theme.panel : (touch.has-hover ? Theme.hover : transparent);
+    accessible-role: tab;
+    accessible-label: root.text;
+    accessible-action-default => {
+        root.clicked();
+    }
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    label := Text {
+        text: root.text;
+        font-weight: root.selected ? 700 : 400;
+        color: root.selected ? Theme.accent : Theme.text;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        y: parent.height - 2px;
+        height: 2px;
+        background: root.selected ? Theme.accent : transparent;
+    }
+}
+
+// A hotkey box with its Record button.
+component HotkeyRow inherits HorizontalLayout {
+    in property <string> label;
+    in-out property <string> value;
+    in property <bool> recording;
+    callback record();
+    spacing: 8px;
+    alignment: start;
+
+    Label {
+        text: root.label;
+        width: 150px;
+    }
+
+    LineEdit {
+        text <=> root.value;
+        width: 220px;
+        placeholder-text: "None";
+    }
+
+    Button {
+        text: root.recording ? "Press the keys..." : "Record";
+        min-width: 130px;
+        clicked => {
+            root.record();
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "FerroType";
+    icon: @image-url("../assets/ferrotype-256.png");
+    preferred-width: 760px;
+    preferred-height: 600px;
+    min-width: 600px;
+    min-height: 460px;
+    background: Theme.background;
+    default-font-size: 13px;
+    always-on-top: root.on-top;
+
+    in property <string> version;
+    // Drives the std widgets' palette; Rust sets `Theme.dark` to match.
+    in property <bool> dark-mode;
+    changed dark-mode => {
+        Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
+    }
+    init => {
+        Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
+    }
+    // Toggled to repaint the whole window (Slint's software renderer otherwise copies only what
+    // it changed itself, which leaves areas Windows lost blank).
+    in property <bool> repaint-all;
+
+    // Editor and typing.
+    in-out property <string> editor-text;
+    in property <string> status: "Ready";
+    in property <bool> typing;
+    in property <float> progress;
+    in-out property <string> min-delay;
+    in-out property <string> max-delay;
+    in-out property <string> countdown;
+    in-out property <bool> on-top;
+    in property <string> hotkey-info;
+    in property <bool> hotkey-problem;
+
+    // 0 Type, 1 History.
+    in-out property <int> tab;
+
+    // History.
+    in property <[HistoryRow]> history;
+    in property <int> history-count;
+    in-out property <string> history-filter;
+    in property <string> history-summary;
+    in property <string> history-empty: "Nothing yet. Text you copy or type shows up here; pin what you want to keep.";
+
+    // Settings page.
+    in-out property <bool> settings-open;
+    in-out property <string> opt-start-hotkey;
+    in-out property <string> opt-stop-hotkey;
+    in-out property <bool> opt-stop-on-focus;
+    in-out property <int> opt-history-mode;
+    in-out property <string> opt-max-entries;
+    in-out property <string> opt-max-mb;
+    in-out property <bool> opt-watch-clipboard;
+    in-out property <bool> opt-skip-private;
+    in-out property <bool> opt-remember-typed;
+    in-out property <int> opt-theme;
+    in-out property <string> settings-error;
+    // Which hotkey box is waiting for keys: 0 start, 1 stop, -1 neither.
+    in-out property <int> recording: -1;
+
+    callback start-stop();
+    callback paste-clipboard();
+    callback pin-editor();
+    callback clear-editor();
+    callback use-entry(int);
+    callback type-entry(int);
+    callback copy-entry(int);
+    callback toggle-pin(int);
+    callback delete-entry(int);
+    callback clear-history();
+    callback filter-edited(string);
+    callback open-settings();
+    callback save-settings();
+    callback close-settings();
+    // A key pressed while recording a hotkey: which box, the key's text, Ctrl, Alt, Shift, Win.
+    callback record-key(int, string, bool, bool, bool, bool);
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+
+        // Tabs, with Settings on the right.
+        HorizontalLayout {
+            spacing: 4px;
+
+            Tab {
+                text: "Type";
+                selected: root.tab == 0;
+                clicked => {
+                    root.tab = 0;
+                }
+            }
+
+            Tab {
+                text: root.history-count > 0 ? "History (" + root.history-count + ")" : "History";
+                selected: root.tab == 1;
+                clicked => {
+                    root.tab = 1;
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            Button {
+                text: "Settings";
+                clicked => {
+                    root.open-settings();
+                }
+            }
+        }
+
+        Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+
+        Text {
+            text: root.status;
+            font-size: 14px;
+            font-weight: 700;
+            wrap: word-wrap;
+            color: root.typing ? Theme.accent : Theme.text;
+        }
+
+        // Type: the text to type and how to type it.
+        if root.tab == 0: VerticalLayout {
+            spacing: 8px;
+            vertical-stretch: 1;
+
+            TextEdit {
+                text <=> root.editor-text;
+                vertical-stretch: 1;
+                wrap: word-wrap;
+                read-only: root.typing;
+                placeholder-text: "Paste or type the text FerroType should type for you.";
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: start;
+
+                Label {
+                    text: "Key delay";
+                    color: Theme.muted;
+                }
+
+                LineEdit {
+                    text <=> root.min-delay;
+                    width: 60px;
+                    input-type: decimal;
+                    enabled: !root.typing;
+                }
+
+                Label {
+                    text: "to";
+                    color: Theme.muted;
+                }
+
+                LineEdit {
+                    text <=> root.max-delay;
+                    width: 60px;
+                    input-type: decimal;
+                    enabled: !root.typing;
+                }
+
+                Label {
+                    text: "s";
+                    color: Theme.muted;
+                }
+
+                Rectangle {
+                    width: 10px;
+                }
+
+                Label {
+                    text: "Countdown";
+                    color: Theme.muted;
+                }
+
+                LineEdit {
+                    text <=> root.countdown;
+                    width: 48px;
+                    input-type: number;
+                    enabled: !root.typing;
+                }
+
+                Label {
+                    text: "s";
+                    color: Theme.muted;
+                }
+
+                Rectangle {
+                    width: 10px;
+                }
+
+                CheckBox {
+                    text: "Keep on top";
+                    checked <=> root.on-top;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: start;
+
+                Button {
+                    text: "From clipboard";
+                    enabled: !root.typing;
+                    clicked => {
+                        root.paste-clipboard();
+                    }
+                }
+
+                Button {
+                    text: "Pin";
+                    enabled: !root.typing && root.editor-text != "";
+                    clicked => {
+                        root.pin-editor();
+                    }
+                }
+
+                Button {
+                    text: "Clear";
+                    enabled: !root.typing;
+                    clicked => {
+                        root.clear-editor();
+                    }
+                }
+            }
+        }
+
+        // History: copied and typed text, pinned entries first. The play button types a line.
+        if root.tab == 1: VerticalLayout {
+            spacing: 6px;
+            vertical-stretch: 1;
+
+            LineEdit {
+                placeholder-text: "Search the history";
+                text <=> root.history-filter;
+                edited(text) => {
+                    root.filter-edited(text);
+                }
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: Theme.panel;
+
+                if root.history.length == 0: Note {
+                    x: 12px;
+                    y: 12px;
+                    width: parent.width - 24px;
+                    text: root.history-empty;
+                    font-size: 12px;
+                }
+
+                if root.history.length > 0: ListView {
+                    for row in root.history: HistoryItem {
+                        entry: row;
+                        open-it => {
+                            root.use-entry(row.id);
+                        }
+                        type-it => {
+                            root.type-entry(row.id);
+                        }
+                        copy => {
+                            root.copy-entry(row.id);
+                        }
+                        toggle-pin => {
+                            root.toggle-pin(row.id);
+                        }
+                        remove => {
+                            root.delete-entry(row.id);
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+
+                Text {
+                    text: Hint.text != "" ? Hint.text : root.history-summary;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    font-size: 11px;
+                    color: Theme.muted;
+                }
+
+                Button {
+                    text: "Clear history";
+                    clicked => {
+                        root.clear-history();
+                    }
+                }
+            }
+        }
+
+        // On both tabs: progress, Start / Stop and the hotkeys.
+        Rectangle {
+            height: 4px;
+            border-radius: 2px;
+            background: Theme.border;
+
+            Rectangle {
+                x: 0;
+                width: parent.width * clamp(root.progress, 0, 1);
+                border-radius: 2px;
+                background: Theme.accent;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 10px;
+
+            Button {
+                text: root.typing ? "Stop" : "Start typing";
+                primary: !root.typing;
+                min-width: 120px;
+                clicked => {
+                    root.start-stop();
+                }
+            }
+
+            Text {
+                text: root.hotkey-info;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                wrap: word-wrap;
+                font-size: 11px;
+                color: root.hotkey-problem ? Theme.error : Theme.muted;
+            }
+        }
+    }
+
+    // Settings, laid over everything else.
+    if root.settings-open: Rectangle {
+        background: Theme.background;
+
+        // Keeps clicks from reaching what's underneath.
+        TouchArea { }
+
+        keys := FocusScope {
+            key-pressed(event) => {
+                if (root.recording < 0) {
+                    return reject;
+                }
+                // Modifiers on their own: wait for the key that goes with them.
+                if (event.text == Key.Shift || event.text == Key.ShiftR || event.text == Key.Control
+                    || event.text == Key.ControlR || event.text == Key.Alt || event.text == Key.AltGr
+                    || event.text == Key.Meta || event.text == Key.MetaR || event.text == Key.CapsLock) {
+                    return accept;
+                }
+                if (event.text == Key.Escape && !event.modifiers.control && !event.modifiers.alt
+                    && !event.modifiers.shift && !event.modifiers.meta) {
+                    root.recording = -1;
+                    return accept;
+                }
+                root.record-key(root.recording, event.text, event.modifiers.control, event.modifiers.alt,
+                    event.modifiers.shift, event.modifiers.meta);
+                root.recording = -1;
+                accept
+            }
+
+            VerticalLayout {
+                ScrollView {
+                    VerticalLayout {
+                        padding: 24px;
+                        spacing: 10px;
+                        alignment: start;
+
+                        Text {
+                            text: "Settings";
+                            font-size: 20px;
+                            font-weight: 700;
+                            color: Theme.text;
+                        }
+
+                        SectionTitle {
+                            text: "Hotkeys";
+                        }
+
+                        HotkeyRow {
+                            label: "Start typing";
+                            value <=> root.opt-start-hotkey;
+                            recording: root.recording == 0;
+                            record => {
+                                root.settings-error = "";
+                                root.recording = 0;
+                                keys.focus();
+                            }
+                        }
+
+                        HotkeyRow {
+                            label: "Stop typing";
+                            value <=> root.opt-stop-hotkey;
+                            recording: root.recording == 1;
+                            record => {
+                                root.settings-error = "";
+                                root.recording = 1;
+                                keys.focus();
+                            }
+                        }
+
+                        Note {
+                            text: "The same combination in both starts and stops with one key; leave a box empty for no hotkey. A hotkey works from any program, so everyday shortcuts like Ctrl+S are refused. Remote Desktop grabs keys while its window has the focus, so the Stop button is the sure way to stop.";
+                        }
+
+                        CheckBox {
+                            text: "Stop typing if another window gets the focus";
+                            checked <=> root.opt-stop-on-focus;
+                        }
+
+                        Note {
+                            text: "Off by default: over Remote Desktop, Windows often reports a different window than the one getting the keys. Typing always pauses while FerroType itself has the focus.";
+                        }
+
+                        SectionTitle {
+                            text: "History";
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+
+                            Label {
+                                text: "Keep";
+                                width: 150px;
+                            }
+
+                            ComboBox {
+                                width: 420px;
+                                model: [
+                                    "No history: only what you pin",
+                                    "History until FerroType closes; save only pins (strict)",
+                                    "History saved between runs (encrypted)",
+                                ];
+                                current-index <=> root.opt-history-mode;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+
+                            Label {
+                                text: "At most";
+                                width: 150px;
+                            }
+
+                            LineEdit {
+                                text <=> root.opt-max-entries;
+                                width: 80px;
+                                input-type: number;
+                            }
+
+                            Label {
+                                text: "entries, and";
+                            }
+
+                            LineEdit {
+                                text <=> root.opt-max-mb;
+                                width: 80px;
+                                input-type: decimal;
+                            }
+
+                            Label {
+                                text: "MB in all (pinned entries don't count)";
+                            }
+                        }
+
+                        CheckBox {
+                            text: "Record text copied in other programs";
+                            checked <=> root.opt-watch-clipboard;
+                        }
+
+                        CheckBox {
+                            text: "Skip passwords copied from password managers";
+                            checked <=> root.opt-skip-private;
+                            enabled: root.opt-watch-clipboard;
+                        }
+
+                        CheckBox {
+                            text: "Record text FerroType types";
+                            checked <=> root.opt-remember-typed;
+                        }
+
+                        Note {
+                            text: "Only text is recorded, never copied files, images or other data. Password managers mark the passwords they copy as private; turn off skipping them and everything copied is recorded. From clipboard always adds its text. Saved history is encrypted so only your Windows account can read it.";
+                        }
+
+                        SectionTitle {
+                            text: "Appearance";
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+
+                            Label {
+                                text: "Theme";
+                                width: 150px;
+                            }
+
+                            ComboBox {
+                                width: 220px;
+                                model: ["Light", "Dark", "Match Windows"];
+                                current-index <=> root.opt-theme;
+                            }
+                        }
+
+                        SectionTitle {
+                            text: "About";
+                        }
+
+                        Text {
+                            text: "FerroType " + root.version + ", the clipboard typing utility";
+                            font-weight: 700;
+                            color: Theme.text;
+                        }
+
+                        Note {
+                            text: "Types text into windows that won't take a paste - remote sessions, consoles, installers, sign-in screens - one real keystroke at a time. Free and open source under the MIT license.";
+                            font-size: 12px;
+                        }
+
+                        AboutSlint { }
+                    }
+                }
+
+                Rectangle {
+                    height: 1px;
+                    background: Theme.border;
+                }
+
+                // Always in view, so saving never means scrolling.
+                HorizontalLayout {
+                    padding-left: 24px;
+                    padding-right: 24px;
+                    padding-top: 10px;
+                    padding-bottom: 12px;
+                    spacing: 8px;
+
+                    Text {
+                        text: root.settings-error;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                        color: Theme.error;
+                    }
+
+                    Button {
+                        text: "Save";
+                        primary: true;
+                        min-width: 100px;
+                        clicked => {
+                            root.save-settings();
+                        }
+                    }
+
+                    Button {
+                        text: "Cancel";
+                        min-width: 100px;
+                        clicked => {
+                            root.close-settings();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Invisible either way; see `repaint-all`.
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        background: root.repaint-all ? #ffffff00 : #00000000;
+    }
+}
