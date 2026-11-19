@@ -1,9 +1,11 @@
 //! A hidden, message-only window on its own thread that receives FerroType's hotkeys
-//! (`RegisterHotKey`) and clipboard changes (`AddClipboardFormatListener`).
+//! (`RegisterHotKey`) and clipboard changes (`AddClipboardFormatListener`), and requests from
+//! another FerroType launched while this one runs (see `instance`).
 //!
 //! These are Windows' intended APIs for both jobs: no keyboard hook watches what the user types,
 //! and nothing polls the clipboard.
 
+use std::hash::{BuildHasher, RandomState};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread::JoinHandle;
@@ -15,9 +17,9 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey, UnregisterHotKey,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, HWND_MESSAGE, MSG, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SendMessageW, TranslateMessage, WM_APP, WM_CLIPBOARDUPDATE, WM_CLOSE,
-    WM_DESTROY, WM_HOTKEY, WNDCLASSEXW,
+    ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
+    HWND_MESSAGE, MSG, MSGFLT_ALLOW, PostMessageW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+    SendMessageW, TranslateMessage, WM_APP, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WNDCLASSEXW,
 };
 
 use crate::clipboard::{self, Clip};
@@ -31,6 +33,10 @@ pub enum Event {
     Hotkey(i32),
     /// The clipboard changed (only while watching it).
     Clipboard(Clip),
+    /// FerroType was launched again: show the window and bring it to the front.
+    ShowWindow,
+    /// Asked to close (uninstalling from Settings → Apps): save and exit.
+    Close,
 }
 
 /// A hotkey to register: the id to report it with, its modifiers and its virtual-key code.
@@ -50,6 +56,9 @@ pub struct Watcher {
     thread: Option<JoinHandle<()>>,
 }
 
+/// The watcher window's class, which another FerroType looks for (see `instance`).
+pub(crate) const CLASS: &str = "FerroTypeWatcher";
+
 const WM_SET_HOTKEYS: u32 = WM_APP + 1;
 const WM_WATCH_CLIPBOARD: u32 = WM_APP + 2;
 
@@ -61,6 +70,31 @@ static LISTENING: AtomicBool = AtomicBool::new(false);
 static CLIPBOARD_LIMIT: AtomicUsize = AtomicUsize::new(2 * 1024 * 1024);
 /// Copies marked private aren't read.
 static SKIP_PRIVATE: AtomicBool = AtomicBool::new(true);
+
+/// The message another FerroType posts to say "show your window".
+pub(crate) fn show_message() -> u32 {
+    static MESSAGE: OnceLock<u32> = OnceLock::new();
+    *MESSAGE.get_or_init(|| registered_message("FerroType.ShowWindow"))
+}
+
+/// The message another FerroType posts to say "close" (uninstalling from Settings → Apps).
+pub(crate) fn close_message() -> u32 {
+    static MESSAGE: OnceLock<u32> = OnceLock::new();
+    *MESSAGE.get_or_init(|| registered_message("FerroType.Close"))
+}
+
+fn registered_message(name: &str) -> u32 {
+    let name = wide(name);
+    // SAFETY: the name is NUL-terminated. 0 (failure) never matches a message, see below.
+    unsafe { RegisterWindowMessageW(name.as_ptr()) }
+}
+
+/// A random number only this process knows, sent with `WM_SET_HOTKEYS`: other programs can find
+/// the watcher window, and the message carries a pointer, so one without it is ignored.
+fn cookie() -> usize {
+    static COOKIE: OnceLock<usize> = OnceLock::new();
+    *COOKIE.get_or_init(|| RandomState::new().hash_one(std::process::id()) as usize)
+}
 
 /// Passed by pointer with `WM_SET_HOTKEYS`.
 struct HotkeyRequest {
@@ -105,7 +139,7 @@ impl Watcher {
         let pointer = (&raw mut request).expose_provenance() as LPARAM;
         // SAFETY: SendMessageW doesn't return until the watcher thread has handled the message,
         // so `request` outlives every use of the pointer there.
-        unsafe { SendMessageW(hwnd(self.window), WM_SET_HOTKEYS, 0, pointer) };
+        unsafe { SendMessageW(hwnd(self.window), WM_SET_HOTKEYS, cookie(), pointer) };
         request.results
     }
 
@@ -136,7 +170,7 @@ fn hwnd(window: isize) -> HWND {
 }
 
 fn create_window() -> Result<isize> {
-    let class = wide("FerroTypeWatcher");
+    let class = wide(CLASS);
     // SAFETY: a null name asks for this program's own module handle.
     let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
     let description = WNDCLASSEXW {
@@ -171,6 +205,10 @@ fn create_window() -> Result<isize> {
     if window.is_null() {
         return Err(Error::last_win32("CreateWindowExW"));
     }
+    // A second launch can bring this FerroType forward even if this one runs as administrator
+    // and that one doesn't. Closing it stays limited to programs at its own level.
+    // SAFETY: a window this thread just created; a null CHANGEFILTERSTRUCT is allowed.
+    unsafe { ChangeWindowMessageFilterEx(window, show_message(), MSGFLT_ALLOW, std::ptr::null_mut()) };
     Ok(window.addr() as isize)
 }
 
@@ -205,15 +243,25 @@ unsafe extern "system" fn window_procedure(window: HWND, message: u32, wparam: W
             )));
             0
         }
-        WM_SET_HOTKEYS => {
+        WM_SET_HOTKEYS if wparam == cookie() => {
             let request: *mut HotkeyRequest = std::ptr::with_exposed_provenance_mut(lparam as usize);
-            // SAFETY: only `Watcher::set_hotkeys` sends this message, with a pointer to a live
-            // HotkeyRequest that nothing else touches until SendMessageW returns.
+            // SAFETY: only `Watcher::set_hotkeys` sends this message with this process's cookie,
+            // with a pointer to a live HotkeyRequest that nothing else touches until SendMessageW
+            // returns.
             let request = unsafe { &mut *request };
             request.results = register_hotkeys(window, &request.wanted);
             0
         }
+        WM_SET_HOTKEYS => 0,
         WM_WATCH_CLIPBOARD => LRESULT::from(listen_to_clipboard(window, wparam != 0)),
+        _ if message != 0 && message == show_message() => {
+            emit(Event::ShowWindow);
+            0
+        }
+        _ if message != 0 && message == close_message() => {
+            emit(Event::Close);
+            0
+        }
         WM_CLOSE => {
             // SAFETY: destroys this thread's own window.
             unsafe { DestroyWindow(window) };

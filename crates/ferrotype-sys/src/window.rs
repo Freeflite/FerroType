@@ -12,7 +12,8 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::GetUpdateRect;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, GWLP_WNDPROC, GetWindowLongPtrW, SetWindowLongPtrW, WM_PAINT, WNDPROC,
+    CallWindowProcW, GWLP_WNDPROC, GetWindowLongPtrW, IsIconic, SW_RESTORE, SetForegroundWindow, SetWindowLongPtrW,
+    ShowWindow, WM_PAINT, WNDPROC,
 };
 
 use crate::{Error, Result};
@@ -49,6 +50,21 @@ pub fn style_title_bar(hwnd: NonZeroIsize, style: &TitleBarStyle) -> Result<()> 
     let _ = set_attribute(hwnd, DWMWA_TEXT_COLOR, style.text.colorref());
     let _ = set_attribute(hwnd, DWMWA_BORDER_COLOR, style.border.colorref());
     Ok(())
+}
+
+/// Brings a top-level window to the front, restoring it first if it's minimized. Windows only
+/// lets it take the foreground if the user's last action allowed it (see
+/// `instance::show_running`).
+pub fn bring_to_front(hwnd: NonZeroIsize) {
+    // An HWND is an opaque handle value, not a pointer to memory we own.
+    let hwnd: HWND = std::ptr::without_provenance_mut(hwnd.get() as usize);
+    // SAFETY: a plain query of a window handle; no pointers.
+    if unsafe { IsIconic(hwnd) } != 0 {
+        // SAFETY: as above.
+        unsafe { ShowWindow(hwnd, SW_RESTORE) };
+    }
+    // SAFETY: as above.
+    unsafe { SetForegroundWindow(hwnd) };
 }
 
 /// Sets a 4-byte window attribute (every attribute used here is a BOOL or COLORREF).

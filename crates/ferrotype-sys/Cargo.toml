@@ -1,6 +1,6 @@
 [package]
 name = "ferrotype-sys"
-description = "Thin, audited Win32 layer for FerroType (keystrokes, hotkeys, clipboard, DPAPI). The only crate in the workspace allowed to use `unsafe`."
+description = "Thin, audited Win32 layer for FerroType (keystrokes, hotkeys, clipboard, DPAPI, security keys, installing). The only crate in the workspace allowed to use `unsafe`."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,16 +12,21 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WindowsWebServices",
     "Win32_Security",
     "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+zeroize.workspace = true
 
 [lints]
 workspace = true

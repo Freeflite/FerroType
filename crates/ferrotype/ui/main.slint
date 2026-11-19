@@ -285,6 +285,20 @@ export component MainWindow inherits Window {
     in property <string> history-summary;
     in property <string> history-empty: "Nothing yet. Text you copy or type shows up here; pin what you want to keep.";
 
+    // The security-key lock on the saved history. lock-state: 0 none, 1 locked, 2 unlocked.
+    in property <int> lock-state;
+    in property <bool> key-busy;
+    in property <bool> keys-supported: true;
+    in property <string> lock-summary;
+    in property <string> key-message;
+
+    // Installing for this Windows account. install-state: 0 not installed, 1 this is the
+    // installed copy, 2 installed (this same build) elsewhere, 3 installed, another build.
+    in property <int> install-state;
+    in property <string> install-summary;
+    in property <string> install-message;
+    in-out property <bool> install-confirm;
+
     // Settings page.
     in-out property <bool> settings-open;
     in-out property <string> opt-start-hotkey;
@@ -312,6 +326,11 @@ export component MainWindow inherits Window {
     callback delete-entry(int);
     callback clear-history();
     callback filter-edited(string);
+    callback unlock-history();
+    callback add-security-key();
+    callback remove-security-lock();
+    callback install();
+    callback uninstall();
     callback open-settings();
     callback save-settings();
     callback close-settings();
@@ -478,6 +497,37 @@ export component MainWindow inherits Window {
         if root.tab == 1: VerticalLayout {
             spacing: 6px;
             vertical-stretch: 1;
+
+            // The saved entries are locked with a security key and not unlocked yet.
+            if root.lock-state == 1: Rectangle {
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: Theme.accent;
+                background: Theme.pinned;
+
+                HorizontalLayout {
+                    padding: 8px;
+                    spacing: 8px;
+
+                    Text {
+                        text: root.key-busy
+                            ? "Waiting for your security key: enter its PIN in Windows' prompt, then touch the key."
+                            : "Your saved entries are locked with a security key.";
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                        color: Theme.text;
+                    }
+
+                    Button {
+                        text: "Unlock";
+                        enabled: !root.key-busy;
+                        clicked => {
+                            root.unlock-history();
+                        }
+                    }
+                }
+            }
 
             LineEdit {
                 placeholder-text: "Search the history";
@@ -739,6 +789,55 @@ export component MainWindow inherits Window {
                         }
 
                         SectionTitle {
+                            text: "Security key";
+                        }
+
+                        Text {
+                            text: root.lock-summary;
+                            wrap: word-wrap;
+                            color: Theme.text;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+
+                            if root.lock-state != 1: Button {
+                                text: root.lock-state == 0 ? "Lock with a security key" : "Add a backup key";
+                                enabled: root.keys-supported && !root.key-busy;
+                                clicked => {
+                                    root.add-security-key();
+                                }
+                            }
+
+                            if root.lock-state == 1: Button {
+                                text: "Unlock";
+                                enabled: !root.key-busy;
+                                clicked => {
+                                    root.unlock-history();
+                                }
+                            }
+
+                            if root.lock-state == 2: Button {
+                                text: "Remove the lock";
+                                enabled: !root.key-busy;
+                                clicked => {
+                                    root.remove-security-lock();
+                                }
+                            }
+                        }
+
+                        if root.key-message != "": Text {
+                            text: root.key-message;
+                            wrap: word-wrap;
+                            color: Theme.accent;
+                        }
+
+                        Note {
+                            text: "Optional. Locks the saved history (your pins, and everything else if history is saved between runs) with a FIDO2 security key such as a YubiKey: after FerroType restarts, unlocking takes the key, its PIN and a touch. Register a second key as a backup; lose your only key and the saved entries can't be recovered. These buttons act straight away; Windows shows the prompts.";
+                        }
+
+                        SectionTitle {
                             text: "Appearance";
                         }
 
@@ -756,6 +855,71 @@ export component MainWindow inherits Window {
                                 model: ["Light", "Dark", "Match Windows"];
                                 current-index <=> root.opt-theme;
                             }
+                        }
+
+                        SectionTitle {
+                            text: "Installation";
+                        }
+
+                        Text {
+                            text: root.install-summary;
+                            wrap: word-wrap;
+                            color: Theme.text;
+                        }
+
+                        if !root.install-confirm: HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+
+                            if root.install-state == 0 || root.install-state == 3: Button {
+                                text: root.install-state == 0 ? "Install" : "Update to this version";
+                                clicked => {
+                                    root.install();
+                                }
+                            }
+
+                            if root.install-state != 0: Button {
+                                text: "Uninstall";
+                                clicked => {
+                                    root.install-confirm = true;
+                                }
+                            }
+                        }
+
+                        if root.install-confirm: Text {
+                            text: "Uninstall FerroType? It's removed from its folder, the Start menu and Settings → Apps" + (root.install-state == 1 ? ", and closes" : "") + ". Your settings and saved history stay.";
+                            wrap: word-wrap;
+                            color: Theme.text;
+                        }
+
+                        if root.install-confirm: HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+
+                            Button {
+                                text: "Uninstall";
+                                clicked => {
+                                    root.install-confirm = false;
+                                    root.uninstall();
+                                }
+                            }
+
+                            Button {
+                                text: "Cancel";
+                                clicked => {
+                                    root.install-confirm = false;
+                                }
+                            }
+                        }
+
+                        if root.install-message != "": Text {
+                            text: root.install-message;
+                            wrap: word-wrap;
+                            color: Theme.accent;
+                        }
+
+                        Note {
+                            text: "Optional: FerroType runs fine from wherever you put it. Settings and history live in %APPDATA%\\FerroType either way, and uninstalling keeps them. Only one FerroType runs at a time; starting it again brings the running one to the front.";
                         }
 
                         SectionTitle {

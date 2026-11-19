@@ -6,6 +6,9 @@ use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, 
 use windows_sys::Win32::System::Threading::{
     ProcessExtensionPointDisablePolicy, ProcessImageLoadPolicy, SetProcessMitigationPolicy,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, MessageBoxW,
+};
 
 /// A NUL-terminated UTF-16 copy of `text`, for Win32 string parameters.
 pub(crate) fn wide(text: &str) -> Vec<u16> {
@@ -58,6 +61,15 @@ pub fn apps_use_light_theme() -> Option<bool> {
         )
     };
     (status == ERROR_SUCCESS).then_some(data != 0)
+}
+
+/// Shows a message box with an OK button, for when there's no window (uninstalling from
+/// Settings → Apps).
+pub fn message_box(title: &str, text: &str, error: bool) {
+    let (title, text) = (wide(title), wide(text));
+    let icon = if error { MB_ICONERROR } else { MB_ICONINFORMATION };
+    // SAFETY: both strings are NUL-terminated; a null owner is allowed.
+    unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | icon | MB_SETFOREGROUND) };
 }
 
 #[cfg(test)]

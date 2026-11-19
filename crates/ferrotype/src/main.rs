@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::cell::RefCell;
+use std::num::NonZeroIsize;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -14,9 +15,13 @@ use ferrotype_core::hotkey::{self, Hotkey, Key};
 use ferrotype_core::rng::Rng;
 use ferrotype_core::settings::{self, BYTES_RANGE, ENTRIES_RANGE, MAX_COUNTDOWN, MAX_DELAY, Settings, ThemeMode};
 use ferrotype_core::typing::{self, Cancel, Keyboard, Outcome, Plan, Progress, Refused};
+use ferrotype_core::vault::{self, DataKey, Sealed, Secret, Vault};
 use ferrotype_core::{format, history, text};
 use ferrotype_sys::clipboard::{self, Clip, Copied};
 use ferrotype_sys::input::{self, Layout, Window};
+use ferrotype_sys::install::{self, Removed};
+use ferrotype_sys::instance;
+use ferrotype_sys::security_key::{self, KeyError};
 use ferrotype_sys::watcher::{Event, HotkeySpec, Watcher};
 use ferrotype_sys::window::{Rgb, TitleBarStyle};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -27,6 +32,10 @@ slint::include_modules!();
 /// Mixed into the history file's encryption, so only FerroType decrypts it as its own.
 const HISTORY_ENTROPY: &[u8] = b"FerroType history v1";
 const HISTORY_FILE: &str = "history.dat";
+
+/// Said once FerroType has been uninstalled.
+const UNINSTALLED: &str = "FerroType was uninstalled. Your settings and saved history were kept, in \
+                           %APPDATA%\\FerroType; delete that folder to remove them too.";
 
 /// Hotkey ids. Each hotkey is also registered with Shift added (see `Hotkey::with_shift`).
 const START: i32 = 1;
@@ -53,6 +62,30 @@ struct App {
     /// What the running job types, to say where it stopped.
     job_text: String,
     save_timer: slint::Timer,
+    /// The security-key lock on the saved history.
+    lock: Lock,
+    /// A security-key prompt is showing.
+    key_busy: bool,
+    /// The vault being set up while the first security key is registered.
+    new_vault: Option<(Vault, DataKey)>,
+    /// This was the installed copy, and it was uninstalled: say so once the window has closed.
+    uninstalled: bool,
+}
+
+/// Whether the saved history is locked with security keys.
+enum Lock {
+    /// No: it's protected by DPAPI (the Windows account) only.
+    None,
+    /// Yes, and not unlocked yet this run: the saved entries aren't loaded, and saving waits.
+    Locked(Sealed),
+    /// Yes, and unlocked until FerroType closes.
+    Open { vault: Vault, key: DataKey },
+}
+
+/// What the history file held.
+enum Loaded {
+    Plain(Vec<Entry>),
+    Locked(Sealed),
 }
 
 impl App {
@@ -68,6 +101,10 @@ impl App {
             job: None,
             job_text: String::new(),
             save_timer: slint::Timer::default(),
+            lock: Lock::None,
+            key_busy: false,
+            new_vault: None,
+            uninstalled: false,
         }
     }
 
@@ -319,7 +356,9 @@ impl App {
     fn history_changed(&mut self, ui: &MainWindow) {
         self.refresh_history(ui);
         self.save_timer.start(slint::TimerMode::SingleShot, Duration::from_secs(1), || {
-            with_app(|app, _| app.save_history());
+            with_app(|app, _| {
+                app.save_history();
+            });
         });
     }
 
@@ -422,6 +461,9 @@ impl App {
     fn pin_editor(&mut self, ui: &MainWindow) {
         let text = ui.get_editor_text().to_string();
         let status = match self.history.pin_text(&text, now()) {
+            Added::New(_) | Added::Moved(_) if matches!(self.lock, Lock::Locked(_)) => {
+                "Pinned for now: it's saved once you unlock the history (History tab).".to_owned()
+            }
             Added::New(_) | Added::Moved(_) => "Pinned: it stays in the history until you unpin it.".to_owned(),
             Added::Skipped(Skip::Blank) => "Nothing to pin.".to_owned(),
             Added::Skipped(Skip::TooBig) => format!(
@@ -457,29 +499,68 @@ impl App {
         self.refresh_history(ui);
     }
 
-    /// Writes the pinned entries (and, if history is saved, the rest) encrypted to the history
-    /// file; removes the file when there's nothing to keep.
-    fn save_history(&self) {
-        let Some(path) = history_path() else { return };
-        let keep = self.history.to_save();
-        if keep.is_empty() {
-            let _ = std::fs::remove_file(&path);
-            return;
+    /// Saves the history (see `write_history`), unless the file has been locked with a security
+    /// key since this FerroType read it (by one in another Windows session, say): a locked file
+    /// this FerroType hasn't unlocked is never overwritten or removed. It takes the lock on
+    /// instead, and saves once it's unlocked.
+    fn save_history(&mut self) -> bool {
+        if matches!(self.lock, Lock::None)
+            && let Some(sealed) = locked_on_disk()
+        {
+            self.lock = Lock::Locked(sealed);
+            if let Some(ui) = self.ui.upgrade() {
+                self.show_lock(&ui);
+                ui.set_status(
+                    "The saved history is locked with a security key: unlock it (History tab) to save changes.".into(),
+                );
+            }
+            return false;
         }
-        if let Ok(sealed) = ferrotype_sys::dpapi::protect(&history::encode(&keep), HISTORY_ENTROPY) {
-            let _ = settings::write_atomically(&path, &sealed);
-        }
+        self.write_history()
     }
 
-    /// Reads the history file back; an unreadable one is set aside rather than overwritten.
+    /// Writes the pinned entries (and, if history is saved, the rest) encrypted to the history
+    /// file: with DPAPI, and inside that with the security-key lock if there is one. Without a
+    /// lock, the file is removed when there's nothing to keep. Returns whether the file is now
+    /// as it should be.
+    fn write_history(&self) -> bool {
+        let Some(path) = history_path() else { return false };
+        let keep = self.history.to_save();
+        let contents = match &self.lock {
+            // Not unlocked this run: the file can't be rewritten without the key, so it stays as
+            // it was, and what changed is saved once it's unlocked.
+            Lock::Locked(_) => return false,
+            // Locked files stay even when empty: they hold the registered keys.
+            Lock::Open { vault, key } => match vault.seal(key, &history::encode(&keep)) {
+                Ok(sealed) => sealed,
+                Err(_) => return false,
+            },
+            Lock::None if keep.is_empty() => return std::fs::remove_file(&path).is_ok() || !path.exists(),
+            Lock::None => history::encode(&keep),
+        };
+        ferrotype_sys::dpapi::protect(&contents, HISTORY_ENTROPY)
+            .is_ok_and(|protected| settings::write_atomically(&path, &protected).is_ok())
+    }
+
+    /// Reads the history file back; an unreadable one is set aside rather than overwritten. A
+    /// file locked with a security key is kept locked until `unlock_history`.
     fn load_history(&mut self) -> Option<String> {
         let path = history_path()?;
         let sealed = std::fs::read(&path).ok()?;
-        let entries =
-            ferrotype_sys::dpapi::unprotect(&sealed, HISTORY_ENTROPY).ok().and_then(|plain| history::decode(&plain));
-        match entries {
-            Some(entries) => {
+        let loaded = ferrotype_sys::dpapi::unprotect(&sealed, HISTORY_ENTROPY).ok().and_then(|plain| {
+            if vault::is_locked_file(&plain) {
+                Sealed::parse(&plain).map(Loaded::Locked)
+            } else {
+                history::decode(&plain).map(Loaded::Plain)
+            }
+        });
+        match loaded {
+            Some(Loaded::Plain(entries)) => {
                 self.history.restore(entries);
+                None
+            }
+            Some(Loaded::Locked(sealed)) => {
+                self.lock = Lock::Locked(sealed);
                 None
             }
             None => {
@@ -504,6 +585,228 @@ impl App {
     }
 
     // -----------------------------------------------------------------------------------------
+    // The security-key lock
+    // -----------------------------------------------------------------------------------------
+
+    /// Shows the lock's state on the History tab and the Settings page.
+    fn show_lock(&self, ui: &MainWindow) {
+        let keys = |vault: &Vault| match vault.slots().len() {
+            1 => "a security key".to_owned(),
+            n => format!("{n} security keys"),
+        };
+        let (state, summary) = match &self.lock {
+            Lock::None if !security_key::supported() => {
+                (0, "This version of Windows can't get secrets from security keys (Windows 11 can).".to_owned())
+            }
+            Lock::None => (0, "Not locked: the saved history is protected by your Windows account only.".to_owned()),
+            Lock::Locked(sealed) => (1, format!("Locked with {}; unlock it to make changes.", keys(sealed.vault()))),
+            Lock::Open { vault, .. } => {
+                (2, format!("Locked with {}, and unlocked until FerroType closes.", keys(vault)))
+            }
+        };
+        ui.set_lock_state(state);
+        ui.set_lock_summary(summary.into());
+        ui.set_key_busy(self.key_busy);
+        ui.set_keys_supported(security_key::supported());
+    }
+
+    /// Says how a security-key step went, in the status line and on the Settings page.
+    fn key_message(&self, ui: &MainWindow, message: &str) {
+        ui.set_key_message(message.into());
+        ui.set_status(message.into());
+    }
+
+    /// Runs a security-key prompt off the UI thread (Windows' prompt blocks until it's answered),
+    /// then hands its result to `done` back on the UI thread.
+    fn key_prompt<T: Send + 'static>(
+        &mut self,
+        ui: &MainWindow,
+        waiting: &str,
+        prompt: impl FnOnce() -> Result<T, KeyError> + Send + 'static,
+        done: fn(&mut App, &MainWindow, Result<T, KeyError>),
+    ) {
+        self.key_busy = true;
+        self.show_lock(ui);
+        self.key_message(ui, waiting);
+        let started = std::thread::Builder::new().name("ferrotype-security-key".into()).spawn(move || {
+            let result = prompt();
+            let _ = slint::invoke_from_event_loop(move || {
+                with_app(|app, ui| {
+                    app.key_busy = false;
+                    done(app, ui, result);
+                    app.show_lock(ui);
+                });
+            });
+        });
+        if started.is_err() {
+            self.key_busy = false;
+            self.show_lock(ui);
+            self.key_message(ui, "Couldn't start talking to the security key.");
+        }
+    }
+
+    fn unlock_history(&mut self, ui: &MainWindow) {
+        let Lock::Locked(sealed) = &self.lock else { return };
+        let Some(window) = window_handle(ui) else { return };
+        if self.key_busy {
+            return;
+        }
+        let credentials = sealed.vault().credentials();
+        let salt = *sealed.vault().salt();
+        self.key_prompt(
+            ui,
+            "Unlocking: enter your security key's PIN in Windows' prompt, then touch the key.",
+            move || security_key::secret(window, &credentials, &salt),
+            App::unlock_finished,
+        );
+    }
+
+    fn unlock_finished(&mut self, ui: &MainWindow, answer: Result<(Vec<u8>, Secret), KeyError>) {
+        let Lock::Locked(sealed) = &self.lock else { return };
+        let opened = answer.map_err(|error| error.to_string()).and_then(|(credential, secret)| {
+            let key = sealed.vault().unlock(&credential, &secret).map_err(|error| error.to_string())?;
+            let plain = sealed.open(&key).map_err(|error| error.to_string())?;
+            let entries = history::decode(&plain).ok_or_else(|| "the locked history is damaged".to_owned())?;
+            Ok((sealed.vault().clone(), key, entries))
+        });
+        match opened {
+            Ok((vault, key, entries)) => {
+                self.lock = Lock::Open { vault, key };
+                // Saved entries join anything recorded while it was locked; saving then keeps both.
+                self.history.restore(entries);
+                self.history_changed(ui);
+                self.key_message(ui, "Unlocked: your saved entries are back until FerroType closes.");
+            }
+            Err(why) => self.key_message(ui, &format!("Not unlocked: {why}.")),
+        }
+    }
+
+    /// Registers a security key: the first one locks the saved history, later ones are backups.
+    fn add_security_key(&mut self, ui: &MainWindow) {
+        if self.key_busy {
+            return;
+        }
+        if !security_key::supported() {
+            return self.key_message(ui, "This version of Windows can't get secrets from security keys.");
+        }
+        let Some(window) = window_handle(ui) else { return };
+        let (salt, exclude) = match &self.lock {
+            Lock::Locked(_) => return self.key_message(ui, "Unlock the history first."),
+            Lock::Open { vault, .. } => (*vault.salt(), vault.credentials()),
+            Lock::None => match Vault::create() {
+                Ok((vault, key)) => {
+                    let salt = *vault.salt();
+                    self.new_vault = Some((vault, key));
+                    (salt, Vec::new())
+                }
+                Err(error) => return self.key_message(ui, &format!("Couldn't start: {error}.")),
+            },
+        };
+        self.key_prompt(
+            ui,
+            "Registering: Windows asks for the security key's PIN and a touch, then for a touch again to check it works.",
+            move || {
+                let credential = security_key::register(window, &exclude)?;
+                security_key::secret(window, &[credential], &salt)
+            },
+            App::key_added,
+        );
+    }
+
+    fn key_added(&mut self, ui: &MainWindow, answer: Result<(Vec<u8>, Secret), KeyError>) {
+        let new_vault = self.new_vault.take();
+        let (credential, secret) = match answer {
+            Ok(answer) => answer,
+            Err(error) => return self.key_message(ui, &format!("Not registered: {error}.")),
+        };
+        let (mut vault, key) = match std::mem::replace(&mut self.lock, Lock::None) {
+            Lock::Open { vault, key } => (vault, key),
+            Lock::None => match new_vault {
+                Some(pair) => pair,
+                None => return,
+            },
+            locked @ Lock::Locked(_) => {
+                self.lock = locked;
+                return;
+            }
+        };
+        let first = vault.slots().is_empty();
+        if let Err(error) = vault.add_key(&credential, &secret, &key, now()) {
+            if !first {
+                self.lock = Lock::Open { vault, key };
+            }
+            return self.key_message(ui, &format!("Not registered: {error}."));
+        }
+        self.lock = Lock::Open { vault, key };
+        let message = if !self.save_history() {
+            "Registered, but the history file couldn't be written; it will be tried again on the next change."
+        } else if first {
+            "Locked with your security key. After FerroType restarts, unlocking takes the key, its PIN and a \
+             touch. Register a second key as a backup: lose your only key and the saved entries are gone."
+        } else {
+            "Backup key registered: any of your registered keys unlocks the history."
+        };
+        self.key_message(ui, message);
+    }
+
+    /// Takes the security-key lock off: the saved history goes back to DPAPI only.
+    fn remove_security_lock(&mut self, ui: &MainWindow) {
+        if self.key_busy || !matches!(self.lock, Lock::Open { .. }) {
+            return;
+        }
+        self.lock = Lock::None;
+        self.write_history();
+        self.show_lock(ui);
+        self.key_message(ui, "The lock is off: the saved history is protected by your Windows account only.");
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Installing
+    // -----------------------------------------------------------------------------------------
+
+    fn show_install(&self, ui: &MainWindow) {
+        let (state, summary) = install_status();
+        ui.set_install_state(state);
+        ui.set_install_summary(summary.into());
+    }
+
+    fn install_message(&self, ui: &MainWindow, message: &str) {
+        ui.set_install_message(message.into());
+        ui.set_status(message.into());
+    }
+
+    fn install(&mut self, ui: &MainWindow) {
+        let installed = std::env::current_exe()
+            .map_err(|error| error.to_string())
+            .and_then(|exe| install::install(&exe).map_err(|error| error.to_string()));
+        match installed {
+            Ok(_) => self.install_message(
+                ui,
+                "Installed: FerroType is in the Start menu and in Settings → Apps. Start it from there from now \
+                 on; this copy keeps running until you close it.",
+            ),
+            Err(why) => self.install_message(ui, &format!("Couldn't install: {why}.")),
+        }
+        self.show_install(ui);
+    }
+
+    fn uninstall(&mut self, ui: &MainWindow) {
+        match install::uninstall() {
+            Ok(Removed::AfterExit) => {
+                // This is the installed copy: it closes, and its file goes once it has.
+                self.uninstalled = true;
+                self.shut_down(ui);
+                let _ = ui.hide();
+            }
+            Ok(Removed::Now) => {
+                self.install_message(ui, "Uninstalled. Your settings and saved history are kept.");
+                self.show_install(ui);
+            }
+            Err(error) => self.install_message(ui, &format!("Couldn't uninstall: {error}.")),
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
     // Settings
     // -----------------------------------------------------------------------------------------
 
@@ -524,6 +827,11 @@ impl App {
         ui.set_opt_remember_typed(s.remember_typed);
         ui.set_opt_theme(ThemeMode::ALL.iter().position(|t| *t == s.theme).unwrap_or(0) as i32);
         ui.set_settings_error(SharedString::new());
+        ui.set_key_message(SharedString::new());
+        self.show_lock(ui);
+        ui.set_install_message(SharedString::new());
+        ui.set_install_confirm(false);
+        self.show_install(ui);
         ui.set_recording(-1);
         ui.set_settings_open(true);
     }
@@ -638,6 +946,9 @@ impl App {
         if let Some(cancel) = &self.job {
             cancel.cancel();
         }
+        if self.key_busy {
+            security_key::cancel();
+        }
         self.read_typing_fields(ui);
         self.save_history();
         // Dropping the watcher unregisters the hotkeys and stops listening to the clipboard.
@@ -744,6 +1055,74 @@ fn history_path() -> Option<PathBuf> {
     Settings::folder().map(|folder| folder.join(HISTORY_FILE))
 }
 
+/// The Settings page's Installation section: 0 not installed, 1 this is the installed copy,
+/// 2 installed (this same build) somewhere else, 3 installed, another build; and what to say.
+fn install_status() -> (i32, String) {
+    let version = env!("CARGO_PKG_VERSION");
+    let Ok(copy) = install::installed_exe() else {
+        return (0, "Not installed (your Programs folder couldn't be found).".to_owned());
+    };
+    let folder = copy.parent().map_or_else(String::new, |folder| folder.display().to_string());
+    if !copy.exists() {
+        return (
+            0,
+            format!(
+                "Not installed: this copy runs from where you put it. Installing copies it to {folder}, for your \
+                 Windows account only (no administrator rights needed), and adds it to the Start menu and to \
+                 Settings → Apps."
+            ),
+        );
+    }
+    let Ok(own) = std::env::current_exe() else { return (2, format!("Installed in {folder}.")) };
+    let here = own.parent().map_or_else(String::new, |folder| folder.display().to_string());
+    if install::same_file(&own, &copy) {
+        (1, format!("Installed in {folder}, and this is the installed copy (version {version})."))
+    } else if install::same_build(&own, &copy) {
+        (2, format!("Installed in {folder} (this same version). This copy runs from {here}."))
+    } else {
+        let theirs = install::installed_version().unwrap_or_else(|| "unknown".to_owned());
+        if theirs == version {
+            (3, format!("Installed in {folder}: another build of version {version}. Update to install this one."))
+        } else {
+            (3, format!("Version {theirs} is installed in {folder}. This is version {version}; update to install it."))
+        }
+    }
+}
+
+/// Uninstalling from Settings → Apps: a running FerroType is asked to close first (it saves its
+/// history as it does), then a message says how it went, as there's no window.
+fn uninstall_from_apps() -> i32 {
+    let message = ferrotype_sys::system::message_box;
+    if !instance::close_running(Duration::from_secs(10)) {
+        message("FerroType", "FerroType is still running. Close it, then uninstall it again.", true);
+        return 1;
+    }
+    match install::uninstall() {
+        Ok(_) => {
+            message("FerroType", UNINSTALLED, false);
+            0
+        }
+        Err(error) => {
+            message("FerroType", &format!("Couldn't uninstall FerroType: {error}."), true);
+            1
+        }
+    }
+}
+
+/// Shows the main window and brings it to the front (FerroType was launched again).
+fn bring_forward(ui: &MainWindow) {
+    if let Some(hwnd) = window_handle(ui).and_then(NonZeroIsize::new) {
+        ferrotype_sys::window::bring_to_front(hwnd);
+    }
+}
+
+/// The history file as it is on disk now, if it's locked with a security key.
+fn locked_on_disk() -> Option<Sealed> {
+    let file = std::fs::read(history_path()?).ok()?;
+    let plain = ferrotype_sys::dpapi::unprotect(&file, HISTORY_ENTROPY).ok()?;
+    if vault::is_locked_file(&plain) { Sealed::parse(&plain) } else { None }
+}
+
 /// Updates the model in place, so the list keeps its scroll position and only changed rows
 /// redraw.
 fn sync_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
@@ -776,6 +1155,15 @@ fn handler<A: 'static>(action: impl Fn(&mut App, &MainWindow, A) + 'static) -> i
 /// Wraps an `App` method as a Slint callback without arguments.
 fn action(action: impl Fn(&mut App, &MainWindow) + 'static) -> impl FnMut() + 'static {
     move || with_app(|app, ui| action(app, ui))
+}
+
+/// The main window's native handle, for Windows' security-key prompts to belong to.
+fn window_handle(ui: &MainWindow) -> Option<isize> {
+    let handle = ui.window().window_handle();
+    match handle.window_handle().map(|h| h.as_raw()) {
+        Ok(RawWindowHandle::Win32(win32)) => Some(win32.hwnd.get()),
+        _ => None,
+    }
 }
 
 /// Paints the native title bar in the current theme's colors.
@@ -815,6 +1203,25 @@ fn main() -> Result<(), slint::PlatformError> {
     // no legacy injection points.
     let _ = ferrotype_sys::system::harden_process();
 
+    // Uninstalling has no window.
+    let arguments: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    match arguments.as_slice() {
+        [flag] if flag == "--uninstall" => std::process::exit(uninstall_from_apps()),
+        [flag, uninstalling] if flag == install::FINISH_UNINSTALL => {
+            if let Ok(uninstalling) = uninstalling.parse() {
+                install::finish_uninstall(uninstalling);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // One FerroType at a time: launched again, it brings the running one forward instead.
+    let Some(_instance) = instance::claim() else {
+        instance::show_running();
+        return Ok(());
+    };
+
     let ui = MainWindow::new()?;
     let app = Rc::new(RefCell::new(App::new(&ui, Settings::load())));
     APP.with(|cell| *cell.borrow_mut() = Some(Rc::clone(&app)));
@@ -830,6 +1237,11 @@ fn main() -> Result<(), slint::PlatformError> {
                 with_app(|app, ui| match event {
                     Event::Hotkey(id) => app.hotkey_pressed(ui, id),
                     Event::Clipboard(clip) => app.clipboard_changed(ui, clip),
+                    Event::ShowWindow => bring_forward(ui),
+                    Event::Close => {
+                        app.shut_down(ui);
+                        let _ = ui.hide();
+                    }
                 });
             });
         })
@@ -837,6 +1249,7 @@ fn main() -> Result<(), slint::PlatformError> {
         app.register_hotkeys(&ui);
         app.apply_clipboard_watch(&ui);
         app.refresh_history(&ui);
+        app.show_lock(&ui);
         if let Some(problem) = problem {
             ui.set_status(problem.into());
         }
@@ -853,6 +1266,11 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.on_delete_entry(handler(App::delete_entry));
     ui.on_clear_history(action(|app, ui| app.clear_history(ui)));
     ui.on_filter_edited(handler(App::filter_edited));
+    ui.on_unlock_history(action(|app, ui| app.unlock_history(ui)));
+    ui.on_add_security_key(action(|app, ui| app.add_security_key(ui)));
+    ui.on_remove_security_lock(action(|app, ui| app.remove_security_lock(ui)));
+    ui.on_install(action(|app, ui| app.install(ui)));
+    ui.on_uninstall(action(|app, ui| app.uninstall(ui)));
     ui.on_open_settings(action(|app, ui| app.open_settings(ui)));
     ui.on_save_settings(action(|app, ui| app.save_settings(ui)));
     ui.on_close_settings(action(|app, ui| app.close_settings(ui)));
@@ -867,7 +1285,10 @@ fn main() -> Result<(), slint::PlatformError> {
     let weak = ui.as_weak();
     slint::Timer::single_shot(Duration::ZERO, move || when_native_window(weak, 0));
     ui.run()?;
-    APP.with(|cell| cell.borrow_mut().take());
+    let uninstalled = APP.with(|cell| cell.borrow_mut().take()).is_some_and(|app| app.borrow().uninstalled);
+    if uninstalled {
+        ferrotype_sys::system::message_box("FerroType", UNINSTALLED, false);
+    }
     Ok(())
 }
 

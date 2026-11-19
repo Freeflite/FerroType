@@ -10,3 +10,4 @@ pub mod rng;
 pub mod settings;
 pub mod text;
 pub mod typing;
+pub mod vault;

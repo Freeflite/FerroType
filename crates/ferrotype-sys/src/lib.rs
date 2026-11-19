@@ -1,4 +1,5 @@
-//! Thin Win32 layer for FerroType: keystrokes, hotkeys, the clipboard, DPAPI and window chrome.
+//! Thin Win32 layer for FerroType: keystrokes, hotkeys, the clipboard, DPAPI, security keys,
+//! window chrome, one-instance-at-a-time and installing.
 //!
 //! This is the only crate in the workspace allowed to use `unsafe`. The rules:
 //!
@@ -11,6 +12,10 @@ pub mod clipboard;
 pub mod dpapi;
 mod error;
 pub mod input;
+pub mod install;
+pub mod instance;
+pub mod security_key;
+mod shortcut;
 pub mod system;
 pub mod watcher;
 pub mod window;

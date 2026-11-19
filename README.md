@@ -6,19 +6,30 @@ real keys, one at a time, the way you would.
 
 Written in Rust with a [Slint](https://slint.dev) UI. One small exe, nothing to install.
 
-> **Status: v0.1.0.** Typing, start/stop hotkeys, history with pins, and settings are in.
->
-> **Coming in 0.2.0 (1 December 2026):** lock your saved history with a YubiKey or another FIDO2
-> security key: after a restart, unlocking takes the key, its PIN and a touch.
+> **Status: v0.2.0.** Typing, start/stop hotkeys, history with pins, settings, an optional
+> security-key (YubiKey) lock on the saved history, and an optional install.
+
+<p align="center">
+  <img src="docs/images/type.png" alt="The Type tab: the text to type, the key delay and countdown, and Start typing" width="49%">
+  <img src="docs/images/history.png" alt="The History tab: copied and typed text, pinned entries first, with a search box" width="49%">
+</p>
 
 ## Download
 
 **[Download the latest `ferrotype.exe`](https://github.com/Freeflite/FerroType/releases/latest)**:
-one file, nothing to install, 64-bit Windows 10 or 11. It isn't code-signed, so the first run
-shows SmartScreen's "Windows protected your PC"; choose **More info → Run anyway**. Each release
-lists SHA-256 checksums and has a signed build-provenance attestation
+one file, 64-bit Windows 10 or 11. It isn't code-signed, so the first run shows SmartScreen's
+"Windows protected your PC"; choose **More info → Run anyway**. Each release lists SHA-256
+checksums and has a signed build-provenance attestation
 (`gh attestation verify ferrotype.exe --repo Freeflite/FerroType`), or
 [build it yourself](#building).
+
+Run it from wherever you put it, or press **Settings → Installation → Install**. That copies it to
+`%LOCALAPPDATA%\Programs\FerroType` and adds it to the Start menu and to Settings → Apps, for
+your Windows account only (no administrator rights). A newer download offers to update the
+installed copy. **Uninstall** (there, or in Settings → Apps) removes it again. Your settings and
+history are kept in `%APPDATA%\FerroType` either way.
+
+Only one FerroType runs at a time: starting it again brings the running one to the front.
 
 ## Using it
 
@@ -80,6 +91,34 @@ While a Remote Desktop window has the focus, it may grab keys before FerroType s
   account can read it. It's kept in `%APPDATA%\FerroType\history.dat`; settings are in
   `settings.ini` next to it.
 
+### Locking it with a security key (optional)
+
+Got a YubiKey or another FIDO2 security key? **Settings → Security key → Lock with a security
+key** locks the saved history with it: your pins, and everything else if history is saved
+between runs. After FerroType restarts, the History tab shows **Unlock**, and unlocking takes the
+key, its PIN and a touch. Someone who gets into your Windows account, or copies the file, can't
+read it without the key.
+
+<p align="center">
+  <img src="docs/images/settings.png" alt="FerroType's Settings page: hotkeys, history, the security key section, appearance" width="60%">
+</p>
+
+- **Register a backup key** (**Add a backup key**). Any registered key unlocks the history. Lose
+  your only key and the saved entries can't be recovered: there's no back door.
+- **Windows does the asking.** FerroType goes through Windows' own security-key API, which shows
+  its own PIN and touch prompts, so FerroType never sees your PIN. No administrator rights and no
+  network needed, and the key's passkey slots aren't used.
+- **How it works:** a random key encrypts the history (AES-256-GCM). That key is stored once per
+  registered security key, encrypted with a key derived from the security key's `hmac-secret`
+  answer, which only that security key can give, and only with its PIN and a touch. Windows' DPAPI
+  still wraps the whole file.
+- **While it's locked** FerroType still types, and records new copies until it closes; pins you add
+  are saved once you unlock. Once unlocked, it stays unlocked until FerroType closes.
+- **Lost a key?** Unlock with another one, press **Remove the lock**, then register your keys
+  again: that starts over with a new encryption key.
+- Needs a key with FIDO2 `hmac-secret` (YubiKey 5 and Security Key series, and most others) and
+  Windows 11 (or a recent Windows 10).
+
 ## What FerroType doesn't do
 
 - **No network access.** No telemetry, no update checks, nothing sent anywhere.
@@ -101,12 +140,17 @@ cargo test --workspace             # unit tests
 pwsh scripts/build-release.ps1     # the release build: hardened, reproducible, no build paths
 ```
 
+The release build is reproducible with the same toolchain: building a commit twice gives the
+same exe, byte for byte. A different Visual Studio linker version gives a different one, which is
+why each release carries a build-provenance attestation saying exactly where its exe came from.
+
 The workspace has three crates:
 
-- `ferrotype-core`: the typing loop, hotkeys, history and settings. No `unsafe`, no Windows
-  calls, all unit-tested.
-- `ferrotype-sys`: the Win32 layer (keystrokes, hotkeys, clipboard, DPAPI), the only crate
-  allowed `unsafe`; every unsafe block is one operation with a `SAFETY:` comment.
+- `ferrotype-core`: the typing loop, hotkeys, history, settings and the security-key vault. No
+  `unsafe`, no Windows calls, all unit-tested.
+- `ferrotype-sys`: the Win32 layer (keystrokes, hotkeys, clipboard, DPAPI, security keys,
+  installing), the only crate allowed `unsafe`; every unsafe block is one operation with a
+  `SAFETY:` comment.
 - `ferrotype`: the Slint app.
 
 ## License

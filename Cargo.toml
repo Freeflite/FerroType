@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/ferrotype-sys", "crates/ferrotype-core", "crates/ferrotype"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -17,6 +17,12 @@ slint = { version = "1.18.1", default-features = false, features = ["std", "comp
 slint-build = "1.18.1"
 raw-window-handle = "0.6.2"
 embed-resource = "3.0.12"
+# Locking the saved history with security keys (RustCrypto: AES-256-GCM, HKDF-SHA256).
+aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "zeroize"] }
+hkdf = "0.12.4"
+sha2 = { version = "0.10.9", default-features = false }
+getrandom = "0.4"
+zeroize = "1.8"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

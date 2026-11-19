@@ -36,9 +36,29 @@ Only the latest release gets security fixes.
   pinned entries are saved. An unreadable file is set aside, never parsed as something else; the
   parser rejects malformed input without panicking (tested against every truncation and
   single-byte change).
+- **Optional security-key lock.** With a FIDO2 security key registered, the saved history is
+  also encrypted with a random 256-bit data key (AES-256-GCM, the file's header as associated
+  data, a fresh nonce on every save). The data key is stored once per registered key, wrapped
+  with AES-256-GCM under HKDF-SHA256 of that key's `hmac-secret` output for the vault's random
+  salt, bound to the credential id. Keys are reached only through Windows' WebAuthn API
+  (`webauthn.dll`), which shows its own PIN and touch prompts, so FerroType never sees the PIN; user
+  verification is required, and credentials aren't discoverable (nothing is stored on the key).
+  Key material is wiped from memory when dropped. It protects the file at rest; while FerroType
+  is running and unlocked, the entries are in its memory as usual. Lose every registered key and
+  the locked entries can't be recovered.
+- **One FerroType at a time.** A named mutex in the session (`Local\`) stops a second copy; it
+  asks the running one to show its window and exits. Two copies would otherwise each save the
+  history file over the other's. Separately, a FerroType that hasn't unlocked a security-key
+  locked file never overwrites or removes it.
+- **Installing stays within your account.** Install copies the exe to
+  `%LOCALAPPDATA%\Programs\FerroType` and adds a Start menu shortcut and an entry under
+  `HKEY_CURRENT_USER\…\Uninstall`; nothing machine-wide. When the installed copy uninstalls
+  itself, a temporary copy in `%TEMP%` deletes it after it exits, then is deleted by Windows
+  (it's opened `FILE_FLAG_DELETE_ON_CLOSE`).
 - **No network access, no telemetry, no update checks.**
 - **No administrator rights.** The manifest asks for `asInvoker`.
 - **Hardened build.** Control Flow Guard, CET shadow-stack compatibility, ASLR/DEP, imports
   from System32 only, a hardened heap, and at startup: System32-only DLL search, no remote or
   low-integrity images, no legacy injection points. Releases are built by CI from the tagged
-  commit, reproducibly, with a signed build-provenance attestation.
+  commit, reproducibly (the same toolchain gives the same exe), with a signed build-provenance
+  attestation.
