@@ -7,6 +7,9 @@ real keys, one at a time, the way you would.
 Written in Rust with a [Slint](https://slint.dev) UI. One small exe, nothing to install.
 
 > **Status: v0.1.0.** Typing, start/stop hotkeys, history with pins, and settings are in.
+>
+> **Coming in 0.2.0 (1 December 2026):** lock your saved history with a YubiKey or another FIDO2
+> security key: after a restart, unlocking takes the key, its PIN and a touch.
 
 ## Download
 
